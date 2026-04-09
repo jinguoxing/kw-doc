@@ -1,807 +1,924 @@
-下面直接给你正式收敛稿：
 
-# 《diff 判定规则 + 本地 apply 规则 最终稿》
+# 一、设计目标
 
-这版是基于我们已经对齐的前提来写的：
+这套 diff 方案的目标，不是“把所有对象逐条查库逐条比”，而是：
 
-1. 源表是 `t_data_view`
-2. 增量顺序按：
+> **按 datasource 分页拉源数据 → 批量加载本地视图和字段 → 内存建索引 → 并发 diff → 小批 apply**
 
-   * `change_time = GREATEST(f_create_time, f_update_time, f_delete_time)`
-   * `ORDER BY change_time, f_view_id`
-3. `change_time` 只负责：
+必须同时满足：
 
-   * 增量顺序
-   * watermark 游标
-4. 操作类型由 diff 引擎判定，不由 `change_time` 直接决定
-5. 第一版建议：
+* **正确性**
 
-   * **按顺序处理**
-   * **遇错即停**
-   * **本地写入必须幂等**
+  * 不漏比较
+  * 不误删除
+  * 不错误推进 watermark
 
----
+* **性能**
 
-# 一、diff 引擎要解决什么问题
+  * 避免 N+1 查询
+  * 避免逐条大事务
+  * page 内用并发加速 CPU 密集阶段
 
-diff 引擎不是简单比较两个 JSON。
-它要回答 3 个问题：
+* **可恢复**
 
-## 1）这条源记录对应本地哪条记录
-
-即匹配问题。
-
-## 2）它相对本地是什么动作
-
-即：
-
-* CREATE
-* UPDATE
-* DELETE
-* RESTORE
-* NOOP
-
-## 3）如果是 UPDATE，到底更新哪些字段
-
-即：
-
-* 视图主字段变了什么
-* 字段列表变了什么
-* 变化严重度是什么
+  * page 顺序执行
+  * watermark 只推进到 `last_safe_cursor`
 
 ---
 
-# 二、源记录标准化模型
+# 二、前置约束与假设
 
-先不要直接拿数据库行做 diff。
-建议先把源记录标准化成统一结构。
+因为你没有把本地 `form_view` / `form_view_field` 的完整表结构贴出来，这里我先按**推荐实现约束**来设计。
 
----
-
-## 2.1 源视图标准模型
-
-```json id="jgl9vm"
-{
-  "source_view_id": "dv_xxx",
-  "datasource_id": "ds_xxx",
-  "group_id": "grp_xxx",
-  "type": "meta",
-  "query_type": "table",
-  "view_name": "订单表",
-  "technical_name": "orders",
-  "comment": "订单主表",
-  "meta_table_name": "ods_orders",
-  "status": "published",
-  "delete_time": 0,
-  "change_time": 1710001234567,
-  "fields": [],
-  "row_hash": "abc123"
-}
-```
+如果你们本地表还没有这些字段，我建议补上。
 
 ---
 
-## 2.2 本地视图标准模型
+## 2.1 本地 `form_view` 建议至少具备这些“源影子字段”
 
-本地建议同步保存 source 影子字段。
+建议字段：
 
-```json id="a8z49g"
-{
-  "local_view_id": "fv_xxx",
-  "source_view_id": "dv_xxx",
-  "source_datasource_id": "ds_xxx",
-  "source_change_time": 1710001230000,
-  "source_delete_time": 0,
-  "source_row_hash": "abc111",
-  "deleted": false,
-  "fields": []
-}
-```
+* `source_view_id`
+* `source_datasource_id`
+* `source_change_time`
+* `source_payload_hash`
+* `source_deleted_at`
 
----
+### 用途
 
-# 三、记录匹配规则
+* `source_view_id`：源视图主键映射
+* `source_datasource_id`：快速按 datasource 过滤
+* `source_change_time`：记录最近一次同步源进度
+* `source_payload_hash`：快速判断视图级是否变化
+* `source_deleted_at`：标记源侧删除时间
 
 ---
 
-## 3.1 视图级主匹配键
+## 2.2 本地 `form_view_field` 建议至少具备这些“源影子字段”
 
-第一优先级：
+建议字段：
 
-```text id="caeipj"
+* `source_view_id`
+* `source_field_key`
+* `source_field_hash`
+
+### 用途
+
+* `source_view_id`：知道字段属于哪个源视图
+* `source_field_key`：字段主键映射
+* `source_field_hash`：快速判断字段是否变化
+
+---
+
+# 三、视图与字段的主键映射规则
+
+这块必须先定死，否则 diff 会越来越乱。
+
+---
+
+## 3.1 视图级匹配规则
+
+### 第一优先级
+
+```text id="wz0icv"
 source_view_id = t_data_view.f_view_id
 ```
 
-也就是本地 form_view 上必须保存：
+### 第二优先级（兜底）
 
-* `source_view_id`
-
----
-
-## 3.2 fallback 匹配键
-
-如果历史数据还没有完整 `source_view_id`，则用兜底：
-
-```text id="dlko6y"
+```text id="97hqvb"
 datasource_id + technical_name
 ```
 
-注意：
-
-* 这只是迁移兼容方案
-* 不能作为长期主键方案
-
----
-
-## 3.3 不建议作为主匹配键的字段
-
-不要用：
-
-* `group_id + view_name`
-
-因为你前面已经明确：
-
-* 元数据视图：`group_id = datasource_id`
-* 自定义视图：`group_id` 是分组语义
-
-这个字段本身语义不稳定。
-
----
-
-# 四、源侧状态判定
-
-diff 引擎第一步先判断源记录当前状态。
-
----
-
-## 4.1 `source_alive`
-
-条件：
-
-```text id="55bav6"
-f_delete_time = 0
-```
-
-表示这条源视图当前是有效的。
-
----
-
-## 4.2 `source_deleted`
-
-条件：
-
-```text id="97x6g6"
-f_delete_time > 0
-```
-
-表示这条源视图当前已经被删除/下线。
-
----
-
-# 五、本地状态判定
-
----
-
-## 5.1 `local_missing`
-
-本地找不到对应记录。
-
----
-
-## 5.2 `local_alive`
-
-本地存在，且未被标记删除/下线。
-
----
-
-## 5.3 `local_deleted`
-
-本地存在，但已标记删除/下线。
-
----
-
-# 六、最终动作判定矩阵
-
-这是核心规则，建议直接写进设计文档。
-
-| 源侧状态    | 本地状态    | 动作               | 说明         |
-| ------- | ------- | ---------------- | ---------- |
-| alive   | missing | CREATE           | 本地新建       |
-| alive   | alive   | UPDATE / NOOP    | 比较是否变化     |
-| alive   | deleted | RESTORE / UPDATE | 本地恢复并同步    |
-| deleted | missing | NOOP             | 已删且本地没有，跳过 |
-| deleted | alive   | DELETE           | 本地下线/删除标记  |
-| deleted | deleted | NOOP             | 幂等跳过       |
-
----
-
-# 七、NOOP 判定规则
-
-很多重复扫描最终都要落到 NOOP，所以这个规则很重要。
-
----
-
-## 7.1 时间比本地旧
-
-如果：
-
-```text id="e9ae7s"
-incoming.change_time < local.source_change_time
-```
-
-则直接：
-
-```text id="cq8v6u"
-NOOP
-```
-
-旧数据不能覆盖新数据。
-
----
-
-## 7.2 时间相同且 hash 相同
-
-如果：
-
-```text id="0vvlty"
-incoming.change_time = local.source_change_time
-and incoming.row_hash = local.source_row_hash
-```
-
-则直接：
-
-```text id="e36e1l"
-NOOP
-```
-
-说明这是一次重放，不需要再 apply。
-
----
-
-## 7.3 源已删，本地也已删
-
-如果：
-
-* `source_deleted`
-* `local_deleted`
-
-则：
-
-```text id="u75m5d"
-NOOP
-```
-
----
-
-# 八、CREATE 判定与 apply 规则
-
----
-
-## 8.1 CREATE 判定条件
-
-满足：
-
-* `source_alive`
-* `local_missing`
-
----
-
-## 8.2 CREATE 需要写什么
-
-本地要新建：
-
-### 视图主记录
-
-* 基础视图信息
-* source 影子字段
-
-### 字段记录
-
-* 从 `f_fields` 展开后批量写入
-
-### source 影子字段建议写入
-
-* `source_view_id`
-* `source_datasource_id`
-* `source_change_time`
-* `source_delete_time = 0`
-* `source_row_hash`
-
----
-
-## 8.3 CREATE 必须是幂等 upsert
-
-第一版不要做“纯 insert 然后报重复”。
-
-应该做成：
-
-* 若本地已存在同 `source_view_id`
-* 则降级成 UPDATE 或直接 skip
-
----
-
-# 九、UPDATE 判定与 apply 规则
-
----
-
-## 9.1 UPDATE 判定条件
-
-满足：
-
-* `source_alive`
-* `local_alive`
-* 且不是 NOOP
-
 也就是：
 
-* `incoming.change_time > local.source_change_time`
-  或
-* `incoming.change_time = local.source_change_time` 且 `hash 不同`
+* `f_data_source_id + f_technical_name`
+
+### 为什么这样定
+
+因为：
+
+* `f_view_id` 是源表稳定主键
+* `technical_name` 更稳定，适合历史数据兜底
+* 不建议用 `f_view_name` 做主键，因为更容易变化
 
 ---
 
-## 9.2 UPDATE 分两层
+## 3.2 字段级匹配规则
 
-### 第一层：视图主字段比较
+当前源表字段来自：
 
-比较这些字段：
+* `t_data_view.f_fields`（JSON / longtext）
 
-* `view_name`
-* `technical_name`
-* `comment`
-* `type`
-* `query_type`
-* `meta_table_name`
-* `status`
+字段主键建议：
 
-### 第二层：字段列表比较
+### 第一优先级
 
-展开 `f_fields` 后逐项比较。
-
----
-
-## 9.3 字段主键规则
-
-字段级比较，第一版建议字段主键这样定：
-
-优先：
-
-```text id="hvjqfq"
+```text id="mq2d4n"
 original_name
 ```
 
-兜底：
+### 第二优先级
 
-```text id="sw9jyt"
+```text id="u97q6h"
 name
 ```
 
-并统一做：
+并统一做标准化：
 
-* trim
-* lower
-* 去引号差异
+* trim 空白
+* lower case
+* 去掉无意义引号
+* 统一下划线/大小写差异处理（如果你们需要）
 
----
+### 最终生成
 
-## 9.4 字段 diff 结果分类
+```text id="ti4w5g"
+field_key
+```
 
-### `field_create`
+这个 `field_key` 就是：
 
-源有，本地没有
-
-### `field_update`
-
-源有，本地有，但属性变化
-
-### `field_delete`
-
-本地有，源没有
-
-### `field_order_change`
-
-只有顺序变化
-
-### `suspected_rename`
-
-疑似 rename，第一版只标记，不自动做 rename 合并
+* 源字段主键
+* 本地 `source_field_key`
 
 ---
 
-## 9.5 UPDATE 的 apply 规则
+# 四、总体 diff 策略
 
-### 视图主记录
-
-只更新变化字段
-
-### 字段记录
-
-* 新增字段：insert
-* 更新字段：update
-* 删除字段：逻辑删除或标记删除
-
-### 最后统一刷新 source 影子字段
-
-* `source_change_time`
-* `source_delete_time`
-* `source_row_hash`
+我们把 diff 分成 **两层**：
 
 ---
 
-# 十、DELETE 判定与 apply 规则
+## 4.1 第一层：视图级 diff
+
+源对象：`t_data_view` 一行
+本地对象：`form_view` 一行
+
+输出结果：
+
+* `NEW_VIEW`
+* `UPDATE_VIEW`
+* `DELETE_VIEW`
+* `UNCHANGED_VIEW`
 
 ---
 
-## 10.1 DELETE 判定条件
+## 4.2 第二层：字段级 diff
 
-满足：
+只有视图需要深入比较时才做字段级比较。
 
-* `source_deleted`
-* `local_alive`
+源对象：`f_fields` 解析出的字段列表
+本地对象：`form_view_field` 列表
+
+输出结果：
+
+* `FIELD_CREATE`
+* `FIELD_UPDATE`
+* `FIELD_DELETE`
+* `FIELD_ORDER_CHANGE`
+* `FIELD_SUSPECTED_RENAME`
 
 ---
 
-## 10.2 DELETE 怎么做
+# 五、源数据标准化（Normalize）
 
-第一版不建议物理删除。
+因为 `t_data_view` 的字段很多，而且 `f_fields` / `f_data_scope` 都是长文本，第一步必须先做标准化。
 
-建议做：
+---
+
+## 5.1 标准化后的 SourceView 结构
+
+建议在代码里定义：
+
+```go id="xsvdjr"
+type SourceView struct {
+    ViewID         string
+    DatasourceID   string
+    GroupID        string
+    ViewName       string
+    TechnicalName  string
+    Type           string
+    QueryType      string
+    Comment        string
+    Status         string
+    MetaTableName  string
+    CreateTime     int64
+    UpdateTime     int64
+    DeleteTime     int64
+    ChangeTime     int64
+    PayloadHash    string
+    Fields         []SourceField
+}
+```
+
+其中：
+
+```go id="w2zcq3"
+ChangeTime = max(CreateTime, UpdateTime, DeleteTime)
+```
+
+---
+
+## 5.2 标准化后的 SourceField 结构
+
+```go id="yadp3d"
+type SourceField struct {
+    FieldKey      string
+    Name          string
+    OriginalName  string
+    DisplayName   string
+    Type          string
+    Index         int
+    Nullable      *bool
+    Extra         map[string]any
+    Hash          string
+}
+```
+
+---
+
+## 5.3 PayloadHash 的推荐计算方式
+
+对视图级 hash，建议基于以下字段做 canonical json 后 hash：
+
+* `f_view_name`
+* `f_technical_name`
+* `f_type`
+* `f_query_type`
+* `f_comment`
+* `f_status`
+* `f_meta_table_name`
+* 标准化后的 `Fields`
+
+### 这样做的意义
+
+如果 hash 相同，说明这个视图整体没有变化，可以直接跳过深比较。
+
+---
+
+# 六、本地加载方案
+
+这里是性能关键点。
+
+---
+
+## 6.1 不允许逐条查本地表
+
+错误做法：
+
+* 一条源 view 查一次 `form_view`
+* 再查一次 `form_view_field`
+
+这样是典型的 N+1。
+
+---
+
+## 6.2 正确做法：批量加载
+
+假设当前 page 有 300 条源 `SourceView`。
+
+### 第一步：批量加载本地 `form_view`
+
+按这一页的：
+
+* `source_view_id IN (...)`
+
+一次查出来。
+
+如果历史数据不完整，再补一轮 fallback：
+
+* `datasource_id = ?`
+* `technical_name IN (...)`
+
+### 第二步：批量加载本地 `form_view_field`
+
+对当前 page 所命中的本地 `form_view_id IN (...)` 一次查出来全部字段。
+
+---
+
+## 6.3 本地内存索引
+
+建议建这几个 map：
 
 ### 视图级
 
-* 标记 deleted / offline
-* 记录删除原因
-* 记录 `source_delete_time`
+```go id="ef0ql8"
+localViewBySourceID   map[string]LocalView
+localViewByFallback   map[string]LocalView
+```
+
+其中 fallback key：
+
+```go id="j0nezy"
+datasource_id + "#" + technical_name
+```
 
 ### 字段级
 
-* 可保留历史，不一定要物理删除
-* 视具体业务可标记不可用
+```go id="eu9lv7"
+localFieldsByFormViewID map[string][]LocalField
+```
+
+以及进一步为单视图生成：
+
+```go id="zr1sud"
+map[fieldKey]LocalField
+```
 
 ---
 
-## 10.3 DELETE 必须幂等
-
-如果一条已删除记录又被重复扫描到：
-
-* 只要本地已经 deleted
-* 就直接 NOOP
+# 七、视图级比较逻辑
 
 ---
 
-# 十一、RESTORE 判定与 apply 规则
+## 7.1 判断视图是否存在
 
-这个场景建议你们第一版就定义上。
+对于一条 `SourceView`：
 
----
+### 先按 `source_view_id` 查
 
-## 11.1 RESTORE 判定条件
+找不到再按：
 
-满足：
+* `datasource_id + technical_name`
 
-* `source_alive`
-* `local_deleted`
-
-这说明：
-
-* 本地之前删过
-* 源侧现在重新有效
+兜底。
 
 ---
 
-## 11.2 RESTORE 怎么做
-
-建议：
-
-### 第一步
-
-把本地状态从 deleted 恢复成 alive
-
-### 第二步
-
-继续走 UPDATE 流程，把主字段和字段列表补齐
-
-### 第三步
-
-刷新 source 影子字段
+## 7.2 视图级结果分类
 
 ---
 
-# 十二、字段级 diff 详细规则
+### CASE 1：本地不存在
+
+结果：
+
+```text id="hfip8h"
+NEW_VIEW
+```
+
+动作：
+
+* 新建 `form_view`
+* 新建全部 `form_view_field`
 
 ---
 
-## 12.1 字段标准化结构
+### CASE 2：源侧已删除
 
-建议先把源字段和本地字段都标准化成：
+判断依据一般是：
 
-```json id="oddoij"
-{
-  "field_key": "order_id",
-  "name": "order_id",
-  "original_name": "order_id",
-  "display_name": "订单ID",
-  "type": "string",
-  "index": 1
+* `f_delete_time > 0`
+* 或 `status` 表示删除/下线
+
+结果：
+
+```text id="pe3m5t"
+DELETE_VIEW
+```
+
+动作：
+
+* 本地标记删除/下线
+* 必要时撤销审核
+
+---
+
+### CASE 3：本地存在，且 `source_payload_hash` 相同
+
+结果：
+
+```text id="7lpwk2"
+UNCHANGED_VIEW
+```
+
+动作：
+
+* 直接跳过
+* `hash_skipped + 1`
+
+---
+
+### CASE 4：本地存在，但 hash 不同
+
+结果：
+
+```text id="9ol51j"
+UPDATE_VIEW
+```
+
+动作：
+
+* 继续做视图字段级深比较
+
+---
+
+# 八、字段级比较逻辑
+
+这部分是核心。
+
+---
+
+## 8.1 先把字段列表 map 化
+
+### 源字段
+
+```go id="mzm34u"
+sourceFieldMap[fieldKey] = SourceField
+```
+
+### 本地字段
+
+```go id="g2oh35"
+localFieldMap[fieldKey] = LocalField
+```
+
+---
+
+## 8.2 字段 diff 分类
+
+---
+
+### 1）源有，本地没有
+
+```text id="7ixcdz"
+FIELD_CREATE
+```
+
+动作：
+
+* 新建本地字段
+
+---
+
+### 2）源没有，本地有
+
+```text id="ku1m2r"
+FIELD_DELETE
+```
+
+动作：
+
+* 本地字段标记删除/下线
+
+---
+
+### 3）源有，本地也有，但 hash 不同
+
+```text id="n2h6ks"
+FIELD_UPDATE
+```
+
+需要进一步判断变化项。
+
+---
+
+## 8.3 字段变化项比较
+
+建议至少比较：
+
+* `DisplayName`
+* `OriginalName`
+* `Type`
+* `Index`
+* `Nullable`
+* 你们业务里其他关键属性
+
+生成：
+
+```go id="d70n30"
+type SingleFieldChange struct {
+    Key                 string
+    DisplayNameChanged  bool
+    OriginalNameChanged bool
+    TypeChanged         bool
+    IndexChanged        bool
+    NullableChanged     bool
 }
 ```
 
 ---
 
-## 12.2 字段比较字段
+## 8.4 疑似 rename 判断
 
-第一版建议至少比较：
+在没有稳定 field_id 的前提下，rename 很难做到 100% 自动识别。
 
-* `name`
-* `original_name`
-* `display_name`
-* `type`
-* `index`
+### 建议做法
 
-如果本地模型有，还可比较：
+如果出现：
 
-* `nullable`
-* `comment`
-* `length`
-* `precision`
+* 一个旧字段删除
+* 一个新字段新增
+* 两者类型相同
+* display_name 高相似
+* 索引位置接近
 
----
+则标记：
 
-## 12.3 字段变化严重度
-
-### S1：高影响
-
-* 字段删除
-* 字段新增
-* 字段类型变化
-* `original_name` 变化
-
-### S2：中影响
-
-* `display_name` 变化
-* nullable 变化
-* comment 变化
-
-### S3：低影响
-
-* index 顺序变化
-
----
-
-# 十三、本地 apply 的事务边界
-
-这部分非常重要。
-
----
-
-## 13.1 一个 view 必须一个事务
-
-也就是说：
-
-> **同一条源视图的主记录 + 字段列表 + source 影子字段更新，必须在一个事务内完成。**
-
-不能拆成：
-
-* view 先成功
-* fields 后失败
-
-否则本地状态会半残。
-
----
-
-## 13.2 建议事务包含的内容
-
-### CREATE
-
-* insert local view
-* insert local fields
-* 写 source 影子字段
-
-### UPDATE
-
-* update local view
-* apply field creates
-* apply field updates
-* apply field deletes
-* update source 影子字段
-
-### DELETE
-
-* mark local view deleted
-* update source_delete_time
-* 记录删除原因
-
-### RESTORE
-
-* mark local view alive
-* 再走 UPDATE
-
----
-
-# 十四、幂等 apply 的最终规则
-
-这是解决“后面已成功，下轮重放怎么办”的关键。
-
----
-
-## 14.1 旧版本输入不允许覆盖新版本本地状态
-
-如果：
-
-```text id="ytjlwm"
-incoming.change_time < local.source_change_time
+```text id="xnr8uk"
+FIELD_SUSPECTED_RENAME
 ```
 
-则：
+### 第一版建议
 
-```text id="jo0vdp"
-skip
-```
-
----
-
-## 14.2 同版本同内容直接 skip
-
-如果：
-
-```text id="k6r4lk"
-incoming.change_time = local.source_change_time
-and incoming.row_hash = local.source_row_hash
-```
-
-则：
-
-```text id="nycssh"
-skip
-```
+* 只做标记，不自动合并为 rename
+* 计数写进 `suspected_rename`
 
 ---
 
-## 14.3 同版本不同内容
+# 九、最终 diff 结果结构
 
-这个场景理论上不该频繁出现，但第一版建议：
+建议统一输出为：
 
-* 记告警
-* 仍按 UPDATE 处理
-* 最终以源最新内容覆盖
-
----
-
-## 14.4 DELETE 重放必须幂等
-
-如果本地已经 deleted，再来同一个删除：
-
-* skip
-
----
-
-## 14.5 CREATE 重放必须幂等
-
-如果本地已存在相同 `source_view_id`：
-
-* 不报重复错误
-* 转为 UPDATE/NOOP
-
----
-
-# 十五、第一版执行策略建议
-
-这里我给你明确建议。
-
----
-
-## 15.1 最推荐的第一版策略：遇错即停
-
-也就是：
-
-### 规则
-
-按 `(change_time, view_id)` 顺序处理时：
-
-* 当前批/页中某条记录 apply 失败
-* 立即停止处理后续记录
-* 当前 job_ds 进入 `retry_waiting` 或 `failed`
-
-### 好处
-
-* watermark 最干净
-* 不会出现“中间有洞、后面先写成功”
-* 一致性最容易保证
-
----
-
-## 15.2 如果后续一定要支持“失败后继续处理”
-
-那也可以，但前提是：
-
-1. 本地必须保存 source 影子字段
-2. apply 必须严格幂等
-3. 下轮必须从 `last_safe_cursor` 重新读
-
-第一版我不建议直接上这个复杂模式。
-
----
-
-# 十六、diff 引擎输出结果建议
-
-建议统一输出一个标准结构，供 apply 层消费。
-
-```json id="4cnm3r"
-{
-  "action": "UPDATE",
-  "severity": "S1",
-  "source_view_id": "dv_xxx",
-  "local_view_id": "fv_xxx",
-  "view_changes": {
-    "comment_changed": true,
-    "meta_table_name_changed": false
-  },
-  "field_changes": {
-    "created": [],
-    "updated": [],
-    "deleted": [],
-    "suspected_rename": []
-  },
-  "source_shadow": {
-    "source_change_time": 1710001234567,
-    "source_delete_time": 0,
-    "source_row_hash": "abc123"
-  }
+```go id="do9ylz"
+type DiffResult struct {
+    News      []CreateViewDiff
+    Updates   []UpdateViewDiff
+    Deletes   []DeleteViewDiff
+    Unchanged []string
+    Stats     SyncStats
 }
 ```
 
-这样：
+其中：
 
-* diff 层只负责判定
-* apply 层只负责执行
-
-边界会很清晰。
+```go id="tkugqa"
+type UpdateViewDiff struct {
+    SourceView   SourceView
+    LocalView    LocalView
+    ViewChanged  bool
+    ViewDelta    ViewMetaDelta
+    FieldDelta   FieldDelta
+    Severity     string // S1/S2/S3
+}
+```
 
 ---
 
-# 十七、最终定稿规则
+# 十、apply 方案
 
-建议你们把这几条直接固化进技术方案。
+diff 完不等于结束，还要 apply。
 
-## Rule 1
+---
 
-`change_time` 仅用于增量顺序和 watermark 游标，不直接表示操作类型。
+## 10.1 建议的 apply 顺序
 
-## Rule 2
+### 每个 page 内
 
-操作类型由 diff 引擎通过“源侧状态 + 本地状态 + hash 比较”判定。
+1. `NEW_VIEW`
+2. `UPDATE_VIEW`
+3. `DELETE_VIEW`
 
-## Rule 3
+### 为什么
 
-视图级动作只允许是：
+这样逻辑最清晰，尤其对字段新增/更新/删除更容易控制。
 
-```text id="c3kvyb"
-CREATE
-UPDATE
-DELETE
-RESTORE
-NOOP
+---
+
+## 10.2 事务策略
+
+### 不建议
+
+* 整个 page 一个超大事务
+
+### 推荐
+
+* 每 20~50 个 view 一个小事务
+* 或每个 view 一个事务（更稳但更慢）
+
+### 第一版推荐
+
+```text id="7q22v3"
+每 20~50 个 view 一组事务
 ```
 
-## Rule 4
+---
 
-本地 apply 必须按单视图事务执行。
+## 10.3 apply 成功后更新哪些本地字段
 
-## Rule 5
-
-本地必须保存 source 影子字段：
+### `form_view`
 
 * `source_view_id`
 * `source_datasource_id`
 * `source_change_time`
-* `source_delete_time`
-* `source_row_hash`
+* `source_payload_hash`
+* `source_deleted_at`
 
-## Rule 6
+### `form_view_field`
 
-旧数据不能覆盖新数据；同版本同内容必须跳过。
+* `source_view_id`
+* `source_field_key`
+* `source_field_hash`
 
-## Rule 7
+---
 
-第一版推荐按顺序处理、遇错即停。
+# 十一、Go 协程 + 管道的性能方案
+
+这里是你特别关心的点。
+
+先给结论：
+
+> **可以用协程和管道，但要分层使用，不能为了并发破坏 datasource 内的顺序执行。**
+
+---
+
+## 11.1 总体并发原则
+
+### datasource 之间
+
+可以并行
+
+### 单 datasource 内的 page
+
+必须顺序执行
+
+### 单 page 内的 diff
+
+可以并行
+
+### watermark 推进
+
+必须串行
+
+---
+
+## 11.2 推荐的流水线模型
+
+---
+
+## 外层：datasource worker 并发
+
+`run-worker` 会同时跑多个 datasource task：
+
+```text id="0q0bha"
+task(ds1) || task(ds2) || task(ds3)
+```
+
+这个并发度由：
+
+* `MaxDatasourceParallelism`
+
+控制。
+
+---
+
+## 内层：单 datasource 的 page 流水线
+
+我建议的 page 级管道是：
+
+```text id="b0w6ju"
+Reader -> PageNormalizer -> LocalLoader -> DiffWorkers -> Aggregator -> Apply -> Watermark
+```
+
+### 解释
+
+#### Reader
+
+顺序从 `t_data_view` 拉 page
+
+#### PageNormalizer
+
+把当前 page 的源记录解析成 `SourceView`
+
+#### LocalLoader
+
+批量查本地 `form_view / form_view_field`
+
+#### DiffWorkers
+
+page 内并行做单 view diff
+
+#### Aggregator
+
+按原顺序收集 diff 结果，计算 stats 和 `last_safe_cursor`
+
+#### Apply
+
+小批事务写本地
+
+#### Watermark
+
+更新 `job_ds` 进度和长期 watermark
+
+---
+
+## 11.3 Page 内 worker pool 推荐
+
+### 配置建议
+
+* `pageSize = 200 ~ 500`
+* `diffWorkers = min(8, CPU*2)`
+
+### 代码示意
+
+```go id="udrjzd"
+type CompareTask struct {
+    Seq        int
+    SourceView SourceView
+    LocalView  *LocalView
+    LocalFields map[string]LocalField
+}
+
+type CompareResult struct {
+    Seq   int
+    Diff  SingleViewDiff
+    Err   error
+}
+```
+
+### worker pool
+
+```go id="vs8mgz"
+tasks := make(chan CompareTask, len(page))
+results := make(chan CompareResult, len(page))
+
+for i := 0; i < diffWorkers; i++ {
+    go func() {
+        for task := range tasks {
+            diff, err := compareOneView(task)
+            results <- CompareResult{
+                Seq:  task.Seq,
+                Diff: diff,
+                Err:  err,
+            }
+        }
+    }()
+}
+```
+
+### 为什么要带 `Seq`
+
+因为虽然 compare 可以并行，但最后聚合和安全 cursor 判断需要知道：
+
+* 当前结果在原 page 顺序中的位置
+
+---
+
+## 11.4 Aggregator 的作用
+
+Aggregator 是这套并发设计的关键。
+
+### 它负责
+
+1. 收集所有 `CompareResult`
+2. 按 `Seq` 排序/还原顺序
+3. 生成 page 级 `DiffResult`
+4. 在 apply 后计算 `last_safe_cursor`
+
+### 为什么它重要
+
+如果没有 Aggregator：
+
+* 结果顺序会乱
+* watermark 没法判断连续成功前缀
+
+---
+
+## 11.5 为什么单 datasource 内 page 不建议并行
+
+因为一旦 page1/page2/page3 并行：
+
+* 哪个先 apply 成功不确定
+* `last_safe_cursor` 会变复杂
+* 失败洞会让 watermark 很难正确推进
+
+### 所以建议
+
+```text id="wzr05l"
+datasource 内 page 串行
+page 内 view diff 并行
+```
+
+这就是最平衡的方案。
+
+---
+
+# 十二、推荐的核心伪代码
+
+---
+
+## 12.1 单 datasource 执行主流程
+
+```go id="kf4e8i"
+func RunDatasourceTask(ctx context.Context, task SyncTask) error {
+    wm, err := watermarkRepo.GetOrInit(ctx, task.DatasourceID)
+    if err != nil {
+        return err
+    }
+
+    cursor := buildCursor(wm)
+    stats := NewSyncStats()
+
+    for {
+        pageRows, nextCursor, err := sourceReader.ReadPage(ctx, task.DatasourceID, cursor, pageSize)
+        if err != nil {
+            return failOrRetry(task, err)
+        }
+        if len(pageRows) == 0 {
+            break
+        }
+
+        sourceViews := normalizePageConcurrently(pageRows)
+
+        localViews, localFields, err := localLoader.BatchLoad(ctx, sourceViews)
+        if err != nil {
+            return failOrRetry(task, err)
+        }
+
+        diffRes, err := diffPageWithWorkerPool(ctx, sourceViews, localViews, localFields, diffWorkers)
+        if err != nil {
+            return failOrRetry(task, err)
+        }
+
+        applyRes, err := applyService.ApplyInMiniBatches(ctx, diffRes, 20)
+        if err != nil {
+            return failOrRetry(task, err)
+        }
+
+        stats.Merge(applyRes.Stats)
+
+        cursor = applyRes.LastSafeCursor
+
+        if err := taskRepo.UpdateProgress(ctx, task.ID, stats, cursor); err != nil {
+            return failOrRetry(task, err)
+        }
+    }
+
+    if err := watermarkRepo.Advance(ctx, task.DatasourceID, cursor, task.ID, task.JobType); err != nil {
+        return failOrRetry(task, err)
+    }
+
+    return taskRepo.MarkSuccess(ctx, task.ID, stats, cursor)
+}
+```
+
+---
+
+# 十三、这套方案的优点
+
+## 1）性能比逐条查快很多
+
+因为是：
+
+* 源分页
+* 本地批量加载
+* page 内并发 diff
+
+---
+
+## 2）watermark 语义不会乱
+
+因为：
+
+* 单 datasource 内 page 串行
+* apply 后再推进 watermark
+
+---
+
+## 3）后续可扩展
+
+后面你们要加：
+
+* `source_payload_hash`
+* `source_field_hash`
+* 更复杂字段规则
+
+都能平滑长上去。
+
+---
+
+# 十四、我对研发落地的最终建议
+
+如果按你们当前方案落地，我建议研发按下面这几个模块拆：
+
+### 1. `source_reader`
+
+负责按 cursor 读 `t_data_view`
+
+### 2. `normalizer`
+
+负责把 `t_data_view` 转成 `SourceView / SourceField`
+
+### 3. `local_loader`
+
+负责批量读本地 `form_view / form_view_field`
+
+### 4. `diff_engine`
+
+负责 page 内并发比较
+
+### 5. `apply_service`
+
+负责小批事务写本地
+
+### 6. `watermark_service`
+
+负责安全推进 watermark
+
+---
+
+# 十五、最终一句话方案
+
+> **“datasource 级串行、page 级流水、view 级并发、apply 小批、watermark 安全推进”**
 
